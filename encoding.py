@@ -1,18 +1,44 @@
 from imports import *
+from utils import *
 
 
 class EncodingModel:
-    def __init__(
-        self,
-        data_dir: str,
-        verbose: bool = True,
-    ):
-        """
-        A lightweight data container for movie-based ROI and rating data.
-        data_dir: root directory (e.g., './Movie_ROI')
-        """
-        self.data_dir = str(data_dir).rstrip("/")
-        self.verbose = verbose
+    def __init__(self, args):
+
+        # ---- normalize args into a dict ----
+        if hasattr(args, "__dict__"):
+            cfg = vars(args)
+        elif isinstance(args, dict):
+            cfg = dict(args)
+        else:
+            raise TypeError("args must be an argparse.Namespace or dict")
+        
+        self.verbose: bool = bool(cfg.get("verbose", True))
+
+        # path        
+        self.data_dir: str = str(cfg.get("data_dir", "./Movie_ROI")).rstrip("/")
+        self.roi_folder: str = str(cfg.get("roi_folder", "movie_tp"))
+        self.roi_pattern: str = str(cfg.get("roi_pattern", "sub-*_ROI114.csv"))
+        self.rating_root: str = str(cfg.get("rating_root", "Rating_ToM"))
+        self.rating_pattern: str = str(cfg.get("rating_pattern", "*-TP.csv"))
+
+        self.atlas_centroid_csv: str = str(cfg.get(
+            "atlas_centroid_csv",
+            "./atlas/Schaefer2018_100Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv"
+        ))
+        self.atlas_out_csv: str = str(cfg.get(
+            "atlas_out_csv",
+            "./atlas/Schaefer2018_114Parcels_7Networks_order_info.csv"
+        ))
+
+        self.features_root: str = str(cfg.get("features_root", "./Movie_ROI/features"))
+
+        # hyperparameters
+        self.outer_folds: int = int(cfg.get("outer_folds", 5))
+        self.num_alphas: int = int(cfg.get("num_alphas", 30))
+        self.mke_outdir: str = str(cfg.get("mke_outdir", "./mke_out"))
+        self.mke_prefix: str = str(cfg.get("mke_prefix", "tp_movie"))
+        self.save_predictions: bool = bool(cfg.get("save_predictions", False))
 
         # ROI data
         self.roi_all = None           # (num_subjects, n_roi, T)
@@ -28,8 +54,8 @@ class EncodingModel:
         self.roi_by_atlas_network_hemi = None         # {Atlas: {Subnetwork: {LH/RH: [roi_ids]}}}
 
         # Feature containers
-        self.feature_dict = {}        # {feature_name: np.ndarray of shape (T, d)}
-        self.feature_names = []       # load order (preserves user-specified order)
+        self.feature_order = ["valence", "tom", "empathy", "num_ppl", "face_present_or_not", "description", "key_word","layer1","layer2","layer3","layer4","layer5","layer6","layer7"]
+
 
 
     # ------------------- ROI LOADER ------------------- #
@@ -37,8 +63,7 @@ class EncodingModel:
         self,
         folder: str,
         pattern: str = "sub-*_ROI114.csv",
-        dtype=np.float32,
-        fillna: bool = True,
+        dtype=np.float32
     ):
         """
         Read ROI CSVs matching a pattern and stack them into self.roi_all.
@@ -54,18 +79,8 @@ class EncodingModel:
         for fp in files:
             df = pd.read_csv(fp)
             arr = df.to_numpy(dtype=dtype)
-
-            # Normalize to (114, T)
-            if arr.shape[0] != 114 and arr.shape[1] == 114:
-                arr = arr.T
-            elif arr.shape[0] != 114:
-                arr = arr.T
-
-            if fillna:
-                arr = np.nan_to_num(arr)
-
+            arr = arr.T
             arrays.append(arr)
-            # Extract subject ID from filename (sub-XXXX)
             m = re.search(r"sub-([A-Za-z0-9]+)", fp.name)
             subject_ids.append(m.group(1) if m else fp.stem)
 
@@ -84,7 +99,6 @@ class EncodingModel:
         Internal helper: open a rating CSV, find the block after '%%%%%%',
         parse as two columns [Second, Rating], and return (N, 2).
         """
-        from io import StringIO
 
         with open(csv_path, "r", encoding="utf-8-sig") as f:
             lines = f.readlines()
@@ -150,7 +164,6 @@ class EncodingModel:
     def load_atlas_info(
         self,
         schaefer_centroid_csv: str,
-        out_csv: str | None = None,
         append_aal: bool = True,
         aal_text: str | None = None,
     ):
@@ -163,8 +176,6 @@ class EncodingModel:
 
         After this, call self.build_roi_groupings() to populate grouping dicts.
         """
-        import re
-        from pathlib import Path
 
         # --- 1) read Schaefer 100 ---
         df = pd.read_csv(schaefer_centroid_csv, skipinitialspace=True)
@@ -271,8 +282,8 @@ class EncodingModel:
 
         self.atlas_df = atlas
 
-        if out_csv:
-            out_path = Path(out_csv)
+        if self.atlas_out_csv:
+            out_path = Path(self.atlas_out_csv)
             if not out_path.exists():
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 atlas.to_csv(out_path, index=False)
@@ -323,12 +334,11 @@ class EncodingModel:
         features_dict,            # dict: {feature_name: X (T, d_k)}
         feature_order,            # list[str]: ordered list of feature names
         roi_data=None,            # optional; if None, will use self.roi_all (shape expected: [S, ROI, T])
-        n_delays=5,               # placeholder; add_delays is commented below
-        outer_folds=5,
-        num_alphas=30,
-        output_dir="./mke_out",
-        prefix="mke",
-        save_predictions=False,
+        outer_folds=None,
+        num_alphas=None,
+        output_dir=None,
+        prefix=None,
+        save_predictions=None,
     ):
         """
         Multi-kernel ridge encoding with per-feature R² decomposition.
@@ -354,6 +364,12 @@ class EncodingModel:
                 raise ValueError("roi_data is None and self.roi_all is not set.")
             roi_data = self.roi_all
         # roi_data expected shape: (n_subjects, n_rois, T)
+
+        if outer_folds is None:    outer_folds = self.outer_folds
+        if num_alphas is None:     num_alphas = self.num_alphas
+        if output_dir is None:     output_dir = self.mke_outdir
+        if prefix is None:         prefix = self.mke_prefix
+        if save_predictions is None: save_predictions = self.save_predictions
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -487,7 +503,6 @@ class EncodingModel:
             n_subjects=int(n_subjects),
             n_rois=int(n_rois),
             n_features_total=int(n_features_total),
-            n_delays=int(n_delays),
             outer_folds=int(outer_folds),
             num_alphas=int(num_alphas),
             chunk_len=int(chunk_len),
@@ -508,11 +523,106 @@ class EncodingModel:
         Placeholder for feature loading.
         Later this function will load all feature CSVs into self.feature_dict.
         """
-        self.feature_dict = {}
-        self.feature_names = []
+
+        cube = self.roi_all
+        ratings_empathy = ratings_per_TR(cube, TR=0.8, start_sec=8.0)
+        ratings_tom = sample_tom_ratings("the_present_tom.csv", start_sec=8.0, TR=0.8)
+        ratings_valence = sample_tom_ratings("the_present_valence.csv", start_sec=8.0, TR=0.8, rating_col="valence_rating")
+        num_ppl = sample_tom_ratings("TP_embeddings.csv", start_sec=8.0, TR=0.8, rating_col="num_people")
+        face_present_or_not = sample_tom_ratings("TP_embeddings.csv", start_sec=8.0, TR=0.8, rating_col="face_present_binary")
+        desc, kw, t= load_four_groups("TP_embeddings.csv")
+        desc_emb = resample_embeddings_to_tr(desc, t, start_sec=8.0, TR=0.8, method="mean")
+        key_word_emb = resample_embeddings_to_tr(kw,   t, start_sec=8.0, TR=0.8, method="mean")
+
+        arrays = load_first7_layers("TP_alexnet_static_features.csv")
+        
+        resampled_arrays = {}
+        for layer in layers:
+            data = arrays[layer]
+            data_tr = resample_embeddings_to_tr(data, t, start_sec=8.0, TR=0.8, method="mean")
+            resampled_arrays[layer] = data_tr
+            print(f"{layer}: {data_tr.shape}")
+
+        T = 239  # number of timepoints
+        TR_list = [0,6,7]
+        lagged_roi = [cube[..., lag:] for lag in TR_list]
+
+        TR_n = 2
+        T = lagged_roi[TR_n].shape[2]
+        self.feature_dict = {
+            "valence": np.array(ratings_valence[:T]).reshape(-1,1),     
+            "tom": np.array(ratings_tom[:T]).reshape(-1,1),          
+            "empathy": np.array(ratings_empathy[:T]).reshape(-1,1),
+            "num_ppl": np.array(num_ppl[:T]).reshape(-1,1),
+            "face_present_or_not": np.array(face_present_or_not[:T]).reshape(-1,1),  
+            "description": np.array(desc_emb[:T]),
+            "key_word": np.array(key_word_emb[:T]),
+            "layer1":np.array(resampled_arrays["conv1"][:T]),
+            "layer2":np.array(resampled_arrays["conv2"][:T]),
+            "layer3":np.array(resampled_arrays["conv3"][:T]),
+            "layer4":np.array(resampled_arrays["conv4"][:T]),
+            "layer5":np.array(resampled_arrays["conv5"][:T]),
+            "layer6":np.array(resampled_arrays["fc6"][:T]),
+            "layer7":np.array(resampled_arrays["fc7"][:T]),
+        } 
+
+        for name, arr in self.feature_dict.items():
+            print(f"{name:15s} → shape {arr.shape}")
+
+
         if self.verbose:
             print(f"[load_features] Placeholder called. root_dir={root_dir}, pattern_map={pattern_map}")
 
+
+    def run(self):
+        """End-to-end pipeline:
+           ROI/rating/atlas → groupings → features → multi-kernel encoding.
+           Expects argparse.Namespace `args` with fields used below.
+        """
+        # -------- paths --------
+        roi_folder_path   = str(Path(self.data_dir) / self.roi_folder)
+        rating_root_path  = str(Path(self.data_dir) / self.rating_root)
+
+        # -------- load ROI cube --------
+        self.load_roi_cube(
+            folder=roi_folder_path,
+            pattern=self.roi_pattern
+        )
+
+        # -------- load ratings (ToM) --------
+        self.load_ratings_tp_all_subjects(
+            root_dir=rating_root_path,
+            target_file_pattern=self.rating_pattern
+        )
+
+        # -------- load atlas & build groupings --------
+        self.load_atlas_info(
+            schaefer_centroid_csv=self.atlas_centroid_csv
+        )
+        self.build_roi_groupings()
+
+        # -------- quick sanity prints --------
+        if self.roi_all is not None:
+            print("ROI cube:", self.roi_all.shape)
+        if self.rating_cube is not None:
+            print("Rating cube:", self.rating_cube.shape)
+        if getattr(self, "atlas_df", None) is not None:
+            print("Atlas table:", self.atlas_df.shape)
+
+        d = getattr(self, "roi_by_network_hemisphere", {}) or {}
+        if "Default" in d:
+            print("Default-LH:", d["Default"].get("LH"))
+            print("Default-RH:", d["Default"].get("RH"))
+
+        # -------- load engineered features --------
+        self.load_features()
+
+        # -------- multi-kernel encoding --------
+        self.multi_kernel_encoding(
+            features_dict=self.feature_dict,
+            feature_order=self.feature_order,
+            roi_data=None,  # None -> use self.roi_all internally
+        )
 
 # ------------------- MAIN TEST ------------------- #
 def main():
@@ -528,50 +638,23 @@ def main():
                         default="./atlas/Schaefer2018_100Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv")
     parser.add_argument("--atlas_out_csv", type=str,
                         default="./atlas/Schaefer2018_114Parcels_7Networks_order_info.csv")
- 
+    
+    parser.add_argument("--features_root", type=str, default="./Movie_ROI/features")
+
+    parser.add_argument("--outer_folds", type=int, default=5)
+    parser.add_argument("--num_alphas", type=int, default=30)
+
+    parser.add_argument("--mke_outdir", type=str, default="./mke_out")
+    parser.add_argument("--mke_prefix", type=str, default="tp_movie")
+    parser.add_argument("--save_predictions", action="store_true")
+
+    parser.add_argument("--verbose", action="store_true")
+
     args = parser.parse_args()
 
-    model = EncodingModel(data_dir=args.data_dir)
+    model = EncodingModel(args) 
+    model.run()
 
-    roi_folder_path = str(Path(args.data_dir) / args.roi_folder)
-    rating_root_path = str(Path(args.data_dir) / args.rating_root)
-
-    # Example usage
-    model.load_roi_cube(
-        folder=roi_folder_path,
-        pattern=args.roi_pattern
-    )
-    model.load_ratings_tp_all_subjects(
-        root_dir=rating_root_path,
-        target_file_pattern=args.rating_pattern
-    )
-
-    model.load_atlas_info(
-        schaefer_centroid_csv=args.atlas_centroid_csv,
-        out_csv=args.atlas_out_csv,
-    )
-    model.build_roi_groupings()
-
-    print("ROI cube:", model.roi_all.shape)
-    print("Rating cube:", model.rating_cube.shape)
-    print("Atlas table:", model.atlas_df.shape)
-    d = model.roi_by_network_hemisphere or {}
-    if "Default" in d:
-        print("Default-LH:", d["Default"].get("LH"))
-        print("Default-RH:", d["Default"].get("RH"))
-
-    model.load_features(root_dir="./Movie_ROI/features")
-
-    model.multi_kernel_encoding(
-        features_dict=model.feature_dict,
-        feature_order=list(model.feature_names),
-        roi_data=None,                 # None -> use model.roi_all
-        outer_folds=5,
-        num_alphas=30,
-        output_dir="./mke_out",
-        prefix="tp_movie",
-        save_predictions=False,
-    )
 
 if __name__ == "__main__":
     main()
