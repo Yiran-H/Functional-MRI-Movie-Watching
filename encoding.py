@@ -39,9 +39,11 @@ class EncodingModel:
         self.mke_outdir: str = str(cfg.get("mke_outdir", "./mke_out"))
         self.mke_prefix: str = str(cfg.get("mke_prefix", "tp_movie"))
         self.save_predictions: bool = bool(cfg.get("save_predictions", False))
+        self.TR_n = 2
 
         # ROI data
         self.roi_all = None           # (num_subjects, n_roi, T)
+        self.lagged_roi = None
         self.roi_subject_ids = None   # list[str]
 
         # Rating data
@@ -339,6 +341,7 @@ class EncodingModel:
         output_dir=None,
         prefix=None,
         save_predictions=None,
+        n_subjects=1,
     ):
         """
         Multi-kernel ridge encoding with per-feature R² decomposition.
@@ -362,7 +365,7 @@ class EncodingModel:
         if roi_data is None:
             if self.roi_all is None:
                 raise ValueError("roi_data is None and self.roi_all is not set.")
-            roi_data = self.roi_all
+            roi_data = self.lagged_roi[self.TR_n]
         # roi_data expected shape: (n_subjects, n_rois, T)
 
         if outer_folds is None:    outer_folds = self.outer_folds
@@ -375,7 +378,7 @@ class EncodingModel:
 
         # Log-spaced alpha values for ridge regularization
         alphas = np.logspace(-5, 5, num_alphas)
-        n_subjects = int(roi_data.shape[0])
+        # n_subjects = int(roi_data.shape[0])
         n_rois     = int(roi_data.shape[1])
         n_features_total = len(feature_order)
 
@@ -399,6 +402,7 @@ class EncodingModel:
             # Step 1: Delay (optional) and standardize each feature
             # ------------------------------------------------------
             delayed_features, feature_dims = [], []
+            print("features_dict:", len(features_dict)) # 14
             for f in feature_order:
                 X = features_dict[f]
                 # If temporal delays are required, uncomment and provide add_delays:
@@ -524,7 +528,7 @@ class EncodingModel:
         Later this function will load all feature CSVs into self.feature_dict.
         """
 
-        cube = self.roi_all
+        cube, _ = load_tp_all_subjects("./Movie_ROI/Rating_ToM", target_file_pattern="*-TP.csv", strict_same_length=True)
         ratings_empathy = ratings_per_TR(cube, TR=0.8, start_sec=8.0)
         ratings_tom = sample_tom_ratings("the_present_tom.csv", start_sec=8.0, TR=0.8)
         ratings_valence = sample_tom_ratings("the_present_valence.csv", start_sec=8.0, TR=0.8, rating_col="valence_rating")
@@ -545,10 +549,10 @@ class EncodingModel:
 
         T = 239  # number of timepoints
         TR_list = [0,6,7]
-        lagged_roi = [cube[..., lag:] for lag in TR_list]
+        self.lagged_roi = [self.roi_all[..., lag:] for lag in TR_list]
 
-        TR_n = 2
-        T = lagged_roi[TR_n].shape[2]
+        TR_n = self.TR_n
+        T = self.lagged_roi[TR_n].shape[2]
         self.feature_dict = {
             "valence": np.array(ratings_valence[:T]).reshape(-1,1),     
             "tom": np.array(ratings_tom[:T]).reshape(-1,1),          
@@ -565,7 +569,7 @@ class EncodingModel:
             "layer6":np.array(resampled_arrays["fc6"][:T]),
             "layer7":np.array(resampled_arrays["fc7"][:T]),
         } 
-
+        print(self.feature_dict["layer7"].shape)
         for name, arr in self.feature_dict.items():
             print(f"{name:15s} → shape {arr.shape}")
 
@@ -622,6 +626,7 @@ class EncodingModel:
             features_dict=self.feature_dict,
             feature_order=self.feature_order,
             roi_data=None,  # None -> use self.roi_all internally
+            n_subjects=5
         )
 
 # ------------------- MAIN TEST ------------------- #

@@ -130,3 +130,57 @@ def load_first7_layers(csv_path):
         print(f"{L}: {arr.shape}")  
 
     return arrays
+
+
+def _read_second_rating_block(csv_path: str) -> np.ndarray:
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        lines = f.readlines()
+
+    start = None
+    for i, ln in enumerate(lines):
+        if "%%%%%%" in ln:
+            start = i + 1
+            break
+
+    numeric_text = "".join(lines[start:])
+    df = pd.read_csv(StringIO(numeric_text), header=None, names=["Second", "Rating"])
+    df = df.apply(pd.to_numeric, errors="coerce").dropna()
+    mat = df[["Second", "Rating"]].to_numpy(dtype=np.float32)  # (N, 2)
+    return mat
+
+def load_tp_all_subjects(
+    root_dir: str,
+    target_file_pattern: str = "S01-TP.csv",  
+    strict_same_length: bool = True,         
+    pad_value: float = np.nan,                
+):
+    root = Path(root_dir)
+    paths = sorted(root.glob(f"*/{target_file_pattern}"))
+    if not paths:
+        raise FileNotFoundError(f"no {root}/*/{target_file_pattern}")
+
+    mats = []
+    subjects = []
+    lengths = []
+    for p in paths:
+        mat = _read_second_rating_block(str(p))  # (N, 2)
+        mats.append(mat)
+        subjects.append(p.parent.name)          
+        lengths.append(mat.shape[0])
+
+    if strict_same_length:
+        N = lengths[0]
+        if any(L != N for L in lengths):
+            details = ", ".join(f"{s}:{L}" for s, L in zip(subjects, lengths))
+            raise ValueError("N is not same：\n" + details)
+        arr = np.stack(mats, axis=0).astype(np.float32)  # (num_subjects, N, 2)
+    else:
+        maxN = max(lengths)
+        arr = np.full((len(mats), maxN, 2), pad_value, dtype=np.float32)
+        for i, mat in enumerate(mats):
+            n = mat.shape[0]
+            arr[i, :n, :] = mat
+        N = maxN
+
+    return arr, subjects  # arr.shape = (num_subjects, N, 2)
